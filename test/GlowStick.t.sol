@@ -47,13 +47,36 @@ contract GlowStickTest is Test {
         assertFalse(won);
     }
 
-    function test_RevertWhen_BettingWithActiveRound() public {
+    function test_RevertWhen_BettingWithActiveRound_Before60s() public {
         vm.prank(alice);
         game.bet{value: 1 ether}(true);
 
         vm.prank(alice);
         vm.expectRevert("Active round exists");
         game.bet{value: 1 ether}(false);
+    }
+
+    function test_BettingWithActiveRound_After60sAutoSettles() public {
+        vm.prank(alice);
+        game.bet{value: 1 ether}(true);
+
+        vm.warp(block.timestamp + 60 seconds);
+        mockPriceFeed.updateAnswer(3500 * 1e8);
+
+        uint256 beforeRebet = alice.balance;
+
+        vm.prank(alice);
+        game.bet{value: 0.5 ether}(false);
+
+        uint256 afterRebet = alice.balance;
+        // Auto-settle previous winning round (1.985 ETH), then place 0.5 ETH new bet.
+        assertEq(afterRebet - beforeRebet, 1.485 ether);
+
+        (uint256 roundId, , , , uint256 amount, bool isUp, bool settled, ) = game.activeRounds(alice);
+        assertEq(roundId, 2);
+        assertEq(amount, 0.5 ether);
+        assertFalse(isUp);
+        assertFalse(settled);
     }
 
     function test_RevertWhen_SettleTooEarly() public {
@@ -64,6 +87,26 @@ contract GlowStickTest is Test {
 
         vm.prank(alice);
         game.settleMyRound();
+    }
+
+    function test_AutomationCheckAndPerformUpkeep() public {
+        vm.prank(alice);
+        game.bet{value: 1 ether}(true);
+
+        (bool neededBefore, ) = game.checkUpkeep("");
+        assertFalse(neededBefore);
+
+        vm.warp(block.timestamp + 60 seconds);
+        mockPriceFeed.updateAnswer(3500 * 1e8);
+
+        (bool neededAfter, bytes memory performData) = game.checkUpkeep("");
+        assertTrue(neededAfter);
+
+        game.performUpkeep(performData);
+
+        (, , , , , , bool settled, bool won) = game.activeRounds(alice);
+        assertTrue(settled);
+        assertTrue(won);
     }
 
     function test_RevertWhen_SettleBeforeDuration() public {

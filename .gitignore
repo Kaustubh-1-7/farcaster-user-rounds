@@ -3,6 +3,9 @@
 .env.unix
 .env.unix*
 
+# Logs and outputs
+deploy_output.txt
+
 # Build artifacts
 out/
 cache/

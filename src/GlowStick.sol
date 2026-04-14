@@ -12,7 +12,12 @@ interface AggregatorV3Interface {
     function latestRoundData() external view returns (uint80 roundId, int256 answer, uint256 startedAt, uint256 updatedAt, uint80 answeredInRound);
 }
 
-contract GlowStick is Ownable {
+interface AutomationCompatibleInterface {
+    function checkUpkeep(bytes calldata checkData) external view returns (bool upkeepNeeded, bytes memory performData);
+    function performUpkeep(bytes calldata performData) external;
+}
+
+contract GlowStick is Ownable, AutomationCompatibleInterface {
     
     // --- Constants & Config ---
     uint256 public constant ROUND_DURATION = 60 seconds; 
@@ -37,6 +42,9 @@ contract GlowStick is Ownable {
 
     mapping(address => UserRound) public activeRounds;
     mapping(address => uint256) public userRoundNonce;
+    address[] public activeUsers;
+    mapping(address => uint256) private activeUserIndex;
+    mapping(address => bool) private isActiveUser;
     
     // Faucet tracking
     mapping(address => bool) public hasUsedFaucet;
@@ -48,6 +56,8 @@ contract GlowStick is Ownable {
     event Claimed(address indexed user, uint256 indexed roundId, uint256 amount);
     event PayoutSent(address indexed user, uint256 indexed roundId, uint256 amount);
     event PayoutQueued(address indexed user, uint256 indexed roundId, uint256 amount);
+    event UserRoundActivated(address indexed user, uint256 indexed roundId);
+    event UserRoundDeactivated(address indexed user, uint256 indexed roundId);
     
     // pass the price feed address (Sepolia ETH/USD: 0x694AA1769357215DE4FAC081bf1f309aDC325306)
     constructor(address _priceFeedAddress) Ownable(msg.sender) {
@@ -59,6 +69,14 @@ contract GlowStick is Ownable {
         return price;
     }
 
+    function getVaultBalance() external view returns (uint256) {
+        return address(this).balance;
+    }
+
+    function activeUsersCount() external view returns (uint256) {
+        return activeUsers.length;
+    }
+
     function hasActiveRound(address _user) public view returns (bool) {
         UserRound memory r = activeRounds[_user];
         return r.roundId != 0 && !r.settled;
@@ -68,7 +86,12 @@ contract GlowStick is Ownable {
     // User starts a private 60-second prediction round.
     function bet(bool _isUp) external payable {
         require(msg.value > 0, "Bet amount must be > 0");
-        require(!hasActiveRound(msg.sender), "Active round exists");
+
+        if (hasActiveRound(msg.sender)) {
+            UserRound memory existing = activeRounds[msg.sender];
+            require(block.timestamp >= existing.startTime + ROUND_DURATION, "Active round exists");
+            _settleRound(msg.sender);
+        }
 
         (, int256 price, , , ) = PRICE_FEED.latestRoundData();
         uint256 newRoundId = userRoundNonce[msg.sender] + 1;
@@ -85,12 +108,37 @@ contract GlowStick is Ownable {
             won: false
         });
 
+        _activateUser(msg.sender);
+
         emit BetPlaced(msg.sender, newRoundId, _isUp, msg.value, price);
+        emit UserRoundActivated(msg.sender, newRoundId);
     }
 
     // User settles their own round after 60 seconds.
     function settleMyRound() external {
-        UserRound storage r = activeRounds[msg.sender];
+        _settleRound(msg.sender);
+    }
+
+    // Chainlink Automation check: finds one matured active user round.
+    function checkUpkeep(bytes calldata) external view override returns (bool upkeepNeeded, bytes memory performData) {
+        for (uint256 i = 0; i < activeUsers.length; i++) {
+            address user = activeUsers[i];
+            UserRound memory r = activeRounds[user];
+            if (!r.settled && r.roundId != 0 && block.timestamp >= r.startTime + ROUND_DURATION) {
+                return (true, abi.encode(user));
+            }
+        }
+        return (false, bytes(""));
+    }
+
+    // Chainlink Automation perform: settles the provided matured user round.
+    function performUpkeep(bytes calldata performData) external override {
+        address user = abi.decode(performData, (address));
+        _settleRound(user);
+    }
+
+    function _settleRound(address _user) internal {
+        UserRound storage r = activeRounds[_user];
         require(r.roundId != 0, "No round found");
         require(!r.settled, "Round already settled");
         require(block.timestamp >= r.startTime + ROUND_DURATION, "Round not finished");
@@ -115,10 +163,41 @@ contract GlowStick is Ownable {
         }
 
         if (payout > 0) {
-            _safePayoutOrQueue(msg.sender, r.roundId, payout);
+            _safePayoutOrQueue(_user, r.roundId, payout);
         }
 
-        emit RoundResolved(msg.sender, r.roundId, r.startPrice, r.endPrice, r.won, payout);
+        _deactivateUser(_user);
+
+        emit RoundResolved(_user, r.roundId, r.startPrice, r.endPrice, r.won, payout);
+        emit UserRoundDeactivated(_user, r.roundId);
+    }
+
+    function _activateUser(address _user) internal {
+        if (isActiveUser[_user]) {
+            return;
+        }
+        activeUserIndex[_user] = activeUsers.length;
+        activeUsers.push(_user);
+        isActiveUser[_user] = true;
+    }
+
+    function _deactivateUser(address _user) internal {
+        if (!isActiveUser[_user]) {
+            return;
+        }
+
+        uint256 idx = activeUserIndex[_user];
+        uint256 lastIdx = activeUsers.length - 1;
+
+        if (idx != lastIdx) {
+            address lastUser = activeUsers[lastIdx];
+            activeUsers[idx] = lastUser;
+            activeUserIndex[lastUser] = idx;
+        }
+
+        activeUsers.pop();
+        delete activeUserIndex[_user];
+        isActiveUser[_user] = false;
     }
 
     function _safePayoutOrQueue(address _user, uint256 _roundId, uint256 _amount) internal {
