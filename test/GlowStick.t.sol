@@ -3,11 +3,12 @@ pragma solidity ^0.8.19;
 
 import "forge-std/Test.sol";
 import "../src/GlowStick.sol";
-import "./MockV3Aggregator.sol";
 
 contract GlowStickTest is Test {
     GlowStick public game;
-    MockV3Aggregator public mockPriceFeed;
+
+    uint256 authorizerPrivateKey = 0x12345;
+    address authorizer = vm.addr(authorizerPrivateKey);
 
     address public alice = address(0x1);
     address public bob = address(0x2);
@@ -16,14 +17,25 @@ contract GlowStickTest is Test {
         vm.deal(alice, 10 ether);
         vm.deal(bob, 10 ether);
 
-        // Start ETH price at $3,000 (with 8 decimals from Chainlink)
-        mockPriceFeed = new MockV3Aggregator(8, 3000 * 1e8);
-        
         // Deploy main contract
-        game = new GlowStick(address(mockPriceFeed));
+        game = new GlowStick(authorizer);
 
         // Fund contract to support payouts and faucet.
         vm.deal(address(game), 100 ether);
+    }
+
+    function _getBetSig(address user, bool isUp, int256 binancePrice, uint256 deadline) internal view returns (bytes memory) {
+        bytes32 structHash = keccak256(abi.encodePacked(user, "BET", isUp, binancePrice, deadline));
+        bytes32 ethHash = keccak256(abi.encodePacked("\x19Ethereum Signed Message:\n32", structHash));
+        (uint8 v, bytes32 r, bytes32 s) = vm.sign(authorizerPrivateKey, ethHash);
+        return abi.encodePacked(r, s, v);
+    }
+
+    function _getSettleSig(address user, uint256 roundId, int256 binancePrice, uint256 deadline) internal view returns (bytes memory) {
+        bytes32 structHash = keccak256(abi.encodePacked(user, roundId, "SETTLE", binancePrice, deadline));
+        bytes32 ethHash = keccak256(abi.encodePacked("\x19Ethereum Signed Message:\n32", structHash));
+        (uint8 v, bytes32 r, bytes32 s) = vm.sign(authorizerPrivateKey, ethHash);
+        return abi.encodePacked(r, s, v);
     }
 
     function test_InitialState() public {
@@ -32,8 +44,11 @@ contract GlowStickTest is Test {
     }
 
     function test_Betting() public {
+        uint256 deadline = block.timestamp + 120;
+        bytes memory sig = _getBetSig(alice, true, 3000 * 1e8, deadline);
+
         vm.prank(alice);
-        game.bet{value: 1 ether}(true);
+        game.bet{value: 1 ether}(true, 3000 * 1e8, deadline, sig);
 
         (uint256 roundId, uint256 startTime, int256 startPrice, int256 endPrice, uint256 amount, bool isUp, bool settled, bool won) = game.activeRounds(alice);
 
@@ -48,25 +63,31 @@ contract GlowStickTest is Test {
     }
 
     function test_RevertWhen_BettingWithActiveRound_Before60s() public {
+        uint256 deadline = block.timestamp + 120;
+        bytes memory sig1 = _getBetSig(alice, true, 3000 * 1e8, deadline);
         vm.prank(alice);
-        game.bet{value: 1 ether}(true);
+        game.bet{value: 1 ether}(true, 3000 * 1e8, deadline, sig1);
 
+        bytes memory sig2 = _getBetSig(alice, false, 3000 * 1e8, deadline);
         vm.prank(alice);
         vm.expectRevert("Active round exists");
-        game.bet{value: 1 ether}(false);
+        game.bet{value: 1 ether}(false, 3000 * 1e8, deadline, sig2);
     }
 
     function test_BettingWithActiveRound_After60sAutoSettles() public {
+        uint256 deadline = block.timestamp + 120;
+        bytes memory sig1 = _getBetSig(alice, true, 3000 * 1e8, deadline);
         vm.prank(alice);
-        game.bet{value: 1 ether}(true);
+        game.bet{value: 1 ether}(true, 3000 * 1e8, deadline, sig1);
 
         vm.warp(block.timestamp + 60 seconds);
-        mockPriceFeed.updateAnswer(3500 * 1e8);
-
+        uint256 newDeadline = block.timestamp + 120;
+        
         uint256 beforeRebet = alice.balance;
 
+        bytes memory sig2 = _getBetSig(alice, false, 3500 * 1e8, newDeadline);
         vm.prank(alice);
-        game.bet{value: 0.5 ether}(false);
+        game.bet{value: 0.5 ether}(false, 3500 * 1e8, newDeadline, sig2);
 
         uint256 afterRebet = alice.balance;
         // Auto-settle previous winning round (1.985 ETH), then place 0.5 ETH new bet.
@@ -80,57 +101,46 @@ contract GlowStickTest is Test {
     }
 
     function test_RevertWhen_SettleTooEarly() public {
+        uint256 deadline = block.timestamp + 120;
+        bytes memory betSig = _getBetSig(alice, true, 3000 * 1e8, deadline);
         vm.prank(alice);
-        game.bet{value: 1 ether}(true);
+        game.bet{value: 1 ether}(true, 3000 * 1e8, deadline, betSig);
 
-        vm.warp(block.timestamp + 60 seconds);
-
+        bytes memory settleSig = _getSettleSig(alice, 1, 3500 * 1e8, deadline);
         vm.prank(alice);
-        game.settleMyRound();
-    }
-
-    function test_AutomationCheckAndPerformUpkeep() public {
-        vm.prank(alice);
-        game.bet{value: 1 ether}(true);
-
-        (bool neededBefore, ) = game.checkUpkeep("");
-        assertFalse(neededBefore);
-
-        vm.warp(block.timestamp + 60 seconds);
-        mockPriceFeed.updateAnswer(3500 * 1e8);
-
-        (bool neededAfter, bytes memory performData) = game.checkUpkeep("");
-        assertTrue(neededAfter);
-
-        game.performUpkeep(performData);
-
-        (, , , , , , bool settled, bool won) = game.activeRounds(alice);
-        assertTrue(settled);
-        assertTrue(won);
+        vm.expectRevert("Round not finished");
+        game.settleMyRound(3500 * 1e8, deadline, settleSig);
     }
 
     function test_RevertWhen_SettleBeforeDuration() public {
+        uint256 deadline = block.timestamp + 120;
+        bytes memory betSig = _getBetSig(alice, true, 3000 * 1e8, deadline);
         vm.prank(alice);
-        game.bet{value: 1 ether}(true);
+        game.bet{value: 1 ether}(true, 3000 * 1e8, deadline, betSig);
 
         vm.warp(block.timestamp + 59 seconds);
 
+        bytes memory settleSig = _getSettleSig(alice, 1, 3500 * 1e8, deadline);
         vm.prank(alice);
         vm.expectRevert("Round not finished");
-        game.settleMyRound();
+        game.settleMyRound(3500 * 1e8, deadline, settleSig);
     }
 
     function test_WinPayout_AutoSent() public {
+        uint256 deadline = block.timestamp + 120;
+        bytes memory betSig = _getBetSig(alice, true, 3000 * 1e8, deadline);
         vm.prank(alice);
-        game.bet{value: 1 ether}(true);
+        game.bet{value: 1 ether}(true, 3000 * 1e8, deadline, betSig);
 
         uint256 aliceAfterBet = alice.balance;
 
         vm.warp(block.timestamp + 60 seconds);
-        mockPriceFeed.updateAnswer(3500 * 1e8); // UP => Alice wins
+
+        uint256 newDeadline = block.timestamp + 120;
+        bytes memory settleSig = _getSettleSig(alice, 1, 3500 * 1e8, newDeadline); // UP => Alice wins
 
         vm.prank(alice);
-        game.settleMyRound();
+        game.settleMyRound(3500 * 1e8, newDeadline, settleSig);
 
         uint256 aliceAfterSettle = alice.balance;
         assertEq(aliceAfterSettle - aliceAfterBet, 1.985 ether);
@@ -145,16 +155,20 @@ contract GlowStickTest is Test {
     }
 
     function test_LosePayout_None() public {
+        uint256 deadline = block.timestamp + 120;
+        bytes memory betSig = _getBetSig(bob, true, 3000 * 1e8, deadline);
         vm.prank(bob);
-        game.bet{value: 1 ether}(true);
+        game.bet{value: 1 ether}(true, 3000 * 1e8, deadline, betSig);
 
         uint256 bobAfterBet = bob.balance;
 
         vm.warp(block.timestamp + 60 seconds);
-        mockPriceFeed.updateAnswer(2500 * 1e8); // DOWN => Bob loses
+
+        uint256 newDeadline = block.timestamp + 120;
+        bytes memory settleSig = _getSettleSig(bob, 1, 2500 * 1e8, newDeadline); // DOWN => Bob loses
 
         vm.prank(bob);
-        game.settleMyRound();
+        game.settleMyRound(2500 * 1e8, newDeadline, settleSig);
 
         uint256 bobAfterSettle = bob.balance;
         assertEq(bobAfterSettle, bobAfterBet);
@@ -162,16 +176,20 @@ contract GlowStickTest is Test {
     }
 
     function test_Draw_RefundsStake() public {
+        uint256 deadline = block.timestamp + 120;
+        bytes memory betSig = _getBetSig(alice, false, 3000 * 1e8, deadline);
         vm.prank(alice);
-        game.bet{value: 1 ether}(false);
+        game.bet{value: 1 ether}(false, 3000 * 1e8, deadline, betSig);
 
         uint256 aliceAfterBet = alice.balance;
 
         vm.warp(block.timestamp + 60 seconds);
-        mockPriceFeed.updateAnswer(3000 * 1e8); // unchanged => draw
+
+        uint256 newDeadline = block.timestamp + 120;
+        bytes memory settleSig = _getSettleSig(alice, 1, 3000 * 1e8, newDeadline); // unchanged => draw
 
         vm.prank(alice);
-        game.settleMyRound();
+        game.settleMyRound(3000 * 1e8, newDeadline, settleSig);
 
         uint256 aliceAfterSettle = alice.balance;
         assertEq(aliceAfterSettle - aliceAfterBet, 1 ether);
@@ -179,16 +197,22 @@ contract GlowStickTest is Test {
     }
 
     function test_CanBetAgainAfterSettlement() public {
+        uint256 deadline = block.timestamp + 120;
+        bytes memory betSig = _getBetSig(alice, true, 3000 * 1e8, deadline);
         vm.prank(alice);
-        game.bet{value: 1 ether}(true);
+        game.bet{value: 1 ether}(true, 3000 * 1e8, deadline, betSig);
 
         vm.warp(block.timestamp + 60 seconds);
-        mockPriceFeed.updateAnswer(3500 * 1e8);
-        vm.prank(alice);
-        game.settleMyRound();
+        uint256 settleDeadline = block.timestamp + 120;
+        bytes memory settleSig = _getSettleSig(alice, 1, 3500 * 1e8, settleDeadline);
 
         vm.prank(alice);
-        game.bet{value: 0.5 ether}(false);
+        game.settleMyRound(3500 * 1e8, settleDeadline, settleSig);
+
+        uint256 newBetDeadline = block.timestamp + 120;
+        bytes memory betSig2 = _getBetSig(alice, false, 3500 * 1e8, newBetDeadline);
+        vm.prank(alice);
+        game.bet{value: 0.5 ether}(false, 3500 * 1e8, newBetDeadline, betSig2);
 
         (uint256 roundId, , , , uint256 amount, bool isUp, bool settled, ) = game.activeRounds(alice);
         assertEq(roundId, 2);

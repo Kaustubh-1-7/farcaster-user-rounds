@@ -4,23 +4,36 @@ import { Button, Frog, TextInput } from 'frog'
 import { devtools } from 'frog/dev'
 import { handle } from 'frog/next'
 import { serveStatic } from 'frog/serve-static'
-import { createPublicClient, formatUnits, http, parseEther } from 'viem'
+import { createPublicClient, formatUnits, http, parseEther, keccak256, encodePacked } from 'viem'
+import { privateKeyToAccount } from 'viem/accounts'
 import { sepolia } from 'viem/chains'
 
-const CONTRACT_ADDRESS = '0xa6311F2973528bE6F076f90aD514c19b77453444'
+const CONTRACT_ADDRESS = '0x045990F11B9d9e0B68EaF5248dDfBC9A963F639D'
+
+const rawPk = process.env.PRIVATE_KEY?.replace(/^0x/, '') || '0000000000000000000000000000000000000000000000000000000000000000'
+const account = privateKeyToAccount(`0x${rawPk}`)
 
 const GLOWSTICK_ABI = [
   {
     type: 'function',
     name: 'bet',
-    inputs: [{ name: '_isUp', type: 'bool' }],
+    inputs: [
+      { name: '_isUp', type: 'bool' },
+      { name: '_binancePrice', type: 'int256' },
+      { name: '_deadline', type: 'uint256' },
+      { name: '_signature', type: 'bytes' }
+    ],
     outputs: [],
     stateMutability: 'payable',
   },
   {
     type: 'function',
     name: 'settleMyRound',
-    inputs: [],
+    inputs: [
+      { name: '_binancePrice', type: 'int256' },
+      { name: '_deadline', type: 'uint256' },
+      { name: '_signature', type: 'bytes' }
+    ],
     outputs: [],
     stateMutability: 'nonpayable',
   },
@@ -45,13 +58,6 @@ const GLOWSTICK_ABI = [
     name: 'pendingWithdrawals',
     inputs: [{ name: '', type: 'address' }],
     outputs: [{ name: '', type: 'uint256' }],
-    stateMutability: 'view',
-  },
-  {
-    type: 'function',
-    name: 'getLatestPrice',
-    inputs: [],
-    outputs: [{ name: '', type: 'int256' }],
     stateMutability: 'view',
   },
   {
@@ -95,11 +101,24 @@ const app = new Frog({
   title: 'GlowStick Bomb',
 })
 
-function getUserAddress(c: unknown): `0x${string}` | undefined {
-  const addr = (c as { address?: string }).address
-  if (addr && addr.startsWith('0x')) {
-    return addr as `0x${string}`
+async function getUserAddress(c: any, urlParam?: string): Promise<`0x${string}` | undefined> {
+  if (urlParam && urlParam.startsWith('0x')) return urlParam as `0x${string}`
+  
+  if (c?.address && c.address.startsWith('0x')) return c.address as `0x${string}`
+
+  if (c?.var?.interactor?.verifiedAccounts?.[0]) return c.var.interactor.verifiedAccounts[0] as `0x${string}`
+  if (c?.var?.interactor?.verifiedAddresses?.ethAddresses?.[0]) return c.var.interactor.verifiedAddresses.ethAddresses[0] as `0x${string}`
+
+  if (c?.frameData?.address && c.frameData.address.startsWith('0x')) return c.frameData.address as `0x${string}`
+  if (c?.frameData?.custodyAddress && c.frameData.custodyAddress.startsWith('0x')) return c.frameData.custodyAddress as `0x${string}`
+
+  if (c?.transactionId) {
+    try {
+      const tx = await publicClient.getTransaction({ hash: c.transactionId as `0x${string}` })
+      if (tx && tx.from) return tx.from
+    } catch(e) {}
   }
+
   return undefined
 }
 
@@ -125,37 +144,16 @@ app.frame('/', (c) => {
     ),
     intents: [
       <Button action="/play">🎮 Play Now</Button>,
-      <Button.Transaction target="/faucet">💧 Get Test ETH</Button.Transaction>,
     ],
   })
 })
 
-app.frame('/start', (c) => {
-  return c.res({
-    image: (
-      <div
-        style={{
-          alignItems: 'center',
-          background: 'radial-gradient(circle at 50% 50%, #111111 0%, #000000 100%)',
-          display: 'flex',
-          flexDirection: 'column',
-          height: '100%',
-          justifyContent: 'center',
-          width: '100%',
-          color: 'white',
-          fontFamily: 'sans-serif',
-        }}
-      >
-        <h1 style={{ fontSize: 72, margin: 0, color: '#00ffcc' }}>GlowStick Bomb</h1>
-        <p style={{ fontSize: 34, marginTop: 14 }}>Start your personal 60s round</p>
-      </div>
-    ),
-    intents: [<Button action="/play">🎮 Play Now</Button>],
-  })
-})
+app.frame('/play', async (c) => { return playFrame(c) })
+app.frame('/play/:addr', async (c) => { return playFrame(c, c.req.param('addr')) })
 
-app.frame('/play', async (c) => {
-  const userAddress = getUserAddress(c)
+async function playFrame(c: any, explicitAddr?: string) {
+  const userAddress = await getUserAddress(c, explicitAddr)
+  const forwardAddr = userAddress || ''
 
   let latestPrice = '--'
   let vaultEth = '--'
@@ -165,52 +163,25 @@ app.frame('/play', async (c) => {
   let isSettled = false
   let direction = 'UP'
   let amountEth = '0'
-  let startTime = 0
-  let startPrice = '--'
   let pendingEth = '0'
 
   try {
     const res = await fetch('https://api.binance.com/api/v3/ticker/price?symbol=ETHUSDT')
     const data = await res.json()
     latestPrice = parseFloat(data.price).toFixed(2)
-  } catch (e) {
-    console.error('Error fetching Binance price:', e)
-    try {
-      const lp = await publicClient.readContract({
-        address: CONTRACT_ADDRESS as `0x${string}`,
-        abi: GLOWSTICK_ABI,
-        functionName: 'getLatestPrice',
-      })
-      latestPrice = formatUnits(lp, 8)
-    } catch(err) {}
-  }
+  } catch (e) {}
 
   try {
-    const vb = await publicClient.readContract({
-      address: CONTRACT_ADDRESS as `0x${string}`,
-      abi: GLOWSTICK_ABI,
-      functionName: 'getVaultBalance',
-    })
-    vaultEth = formatUnits(vb, 18)
-  } catch (e) {
-    console.error('Error reading vault balance:', e)
-  }
-
-  try {
-    const au = await publicClient.readContract({
-      address: CONTRACT_ADDRESS as `0x${string}`,
-      abi: GLOWSTICK_ABI,
-      functionName: 'activeUsersCount',
-    })
+    const vb = await publicClient.readContract({ address: CONTRACT_ADDRESS, abi: GLOWSTICK_ABI, functionName: 'getVaultBalance' })
+    vaultEth = formatUnits(vb as bigint, 18)
+    const au = await publicClient.readContract({ address: CONTRACT_ADDRESS, abi: GLOWSTICK_ABI, functionName: 'activeUsersCount' })
     autoQueue = au.toString()
-  } catch (e) {
-    console.error('Error reading active users count:', e)
-  }
+  } catch (e) {}
 
   if (userAddress) {
     try {
       const r = await publicClient.readContract({
-        address: CONTRACT_ADDRESS as `0x${string}`,
+        address: CONTRACT_ADDRESS,
         abi: GLOWSTICK_ABI,
         functionName: 'activeRounds',
         args: [userAddress],
@@ -219,277 +190,183 @@ app.frame('/play', async (c) => {
       roundId = Number(r[0])
       isSettled = Boolean(r[6])
       direction = Boolean(r[5]) ? 'UP' : 'DOWN'
-      amountEth = formatUnits(r[4], 18)
-      startPrice = formatUnits(r[2], 8)
+      amountEth = formatUnits(r[4] as bigint, 18)
 
       if (roundId > 0 && !isSettled) {
-        startTime = Number(r[1])
+        const startTime = Number(r[1])
         const now = Math.floor(Date.now() / 1000)
         timeLeft = Math.max(0, 60 - (now - startTime))
       }
 
       const pending = await publicClient.readContract({
-        address: CONTRACT_ADDRESS as `0x${string}`,
+        address: CONTRACT_ADDRESS,
         abi: GLOWSTICK_ABI,
         functionName: 'pendingWithdrawals',
         args: [userAddress],
       })
-      pendingEth = formatUnits(pending, 18)
-    } catch (e) {
-      console.error('Error reading user round:', e)
-    }
+      pendingEth = formatUnits(pending as bigint, 18)
+    } catch (e) { }
   }
 
   const hasActive = roundId > 0 && !isSettled
-  const nowTs = Math.floor(Date.now() / 1000)
-  const waitDirection = direction.toLowerCase()
-  const automationDelayHint = 'Automation may take ~10-60s after timer ends on Sepolia.'
+  const automationDelayHint = 'Automation may take ~10-60s on Sepolia.'
 
   const intents = hasActive
     ? timeLeft > 0
       ? [
-          <Button action={`/waiting/${waitDirection}/${startTime}/${startPrice}`}>⏱ Live Timer</Button>,
-          <Button action={`/result/dev/${waitDirection}/${startTime}/${startPrice}`}>📊 View Result</Button>,
+          <Button action={`/waiting/${forwardAddr}`}>⏱ Live Timer</Button>,
         ]
       : [
-          <Button action={`/waiting/${waitDirection}/${startTime}/${startPrice}`}>⏳ Wait Automation</Button>,
-          <Button.Transaction target="/settle" action={`/result/dev/${waitDirection}/${startTime}/${startPrice}`}>⚙️ Manual Settle</Button.Transaction>,
-          <Button action={`/result/dev/${waitDirection}/${startTime}/${startPrice}`}>📊 View Result</Button>,
+          <Button action={`/waiting/${forwardAddr}`}>⏳ Wait Block</Button>,
+          <Button.Transaction target="/settle" action={`/result/${forwardAddr}`}>⚙️ Manual Settle</Button.Transaction>,
+          <Button action={`/result/${forwardAddr}`}>📊 View Result</Button>,
         ]
     : [
         <TextInput placeholder="Stake Amount (e.g., 0.01)" />,
-        <Button.Transaction target="/bet/up" action={`/waiting/up/${nowTs}/${latestPrice}`}>📈 UP</Button.Transaction>,
-        <Button.Transaction target="/bet/down" action={`/waiting/down/${nowTs}/${latestPrice}`}>📉 DOWN</Button.Transaction>,
+        <Button.Transaction target="/bet/up" action={`/waiting`}>📈 UP</Button.Transaction>,
+        <Button.Transaction target="/bet/down" action={`/waiting`}>📉 DOWN</Button.Transaction>,
+        <Button action={`/play/${forwardAddr}`}>🔄 Refresh</Button>,
       ]
 
   return c.res({
     image: (
-      <div
-        style={{
-          alignItems: 'center',
-          background: 'radial-gradient(circle at 50% 50%, #1a1a2e 0%, #16213e 100%)',
-          display: 'flex',
-          flexDirection: 'column',
-          height: '100%',
-          justifyContent: 'center',
-          width: '100%',
-          fontFamily: 'sans-serif',
-          color: 'white',
-        }}
-      >
+      <div style={{ alignItems: 'center', background: 'radial-gradient(circle at 50% 50%, #1a1a2e 0%, #16213e 100%)', display: 'flex', flexDirection: 'column', height: '100%', justifyContent: 'center', width: '100%', fontFamily: 'sans-serif', color: 'white' }}>
         <h1 style={{ fontSize: 58, color: '#e94560', margin: 0 }}>Place Your Bet!</h1>
-        <p style={{ fontSize: 30, color: '#00ffcc', marginTop: 10, marginBottom: 0 }}>
-          Current Price: ${latestPrice}
-        </p>
-        <p style={{ fontSize: 20, color: '#d5d8ff', marginTop: 8, marginBottom: 0 }}>
-          Vault: {vaultEth} ETH | Automation Queue: {autoQueue}
-        </p>
-        <p style={{ fontSize: 18, color: '#aaa', marginTop: 6, marginBottom: 0 }}>
-          Pending Payout: {pendingEth} ETH
-        </p>
+        <p style={{ fontSize: 30, color: '#00ffcc', marginTop: 10, marginBottom: 0 }}>Current Price: ${latestPrice}</p>
+        <p style={{ fontSize: 20, color: '#d5d8ff', marginTop: 8, marginBottom: 0 }}>Vault: {vaultEth} ETH | Queue: {autoQueue}</p>
+        <p style={{ fontSize: 18, color: '#aaa', marginTop: 6, marginBottom: 0 }}>Pending Payout: {pendingEth} ETH</p>
         {hasActive ? (
           <div style={{ display: 'flex', flexDirection: 'column', marginTop: 20, alignItems: 'center' }}>
             <p style={{ fontSize: 30, margin: 0 }}>Round #{roundId} ({direction})</p>
             <p style={{ fontSize: 24, color: '#aaa', marginTop: 8 }}>Stake: {amountEth} ETH</p>
             <p style={{ fontSize: 40, marginTop: 14 }}>[ {timeLeft > 0 ? `${timeLeft}s` : 'READY TO SETTLE'} ]</p>
-            {timeLeft === 0 ? (
-              <p style={{ fontSize: 18, color: '#ffd98f', marginTop: 8 }}>{automationDelayHint}</p>
-            ) : null}
+            {timeLeft === 0 ? <p style={{ fontSize: 18, color: '#ffd98f', marginTop: 8 }}>{automationDelayHint}</p> : null}
           </div>
         ) : (
-          <p style={{ fontSize: 24, color: '#aaa', marginTop: 22 }}>
-            Predict if price goes up or down in the next 60 seconds. If your previous round already matured, a new bet auto-settles it.
+          <p style={{ fontSize: 24, color: '#aaa', marginTop: 22, textAlign: 'center', padding: '0 40px' }}>
+            Predict if price goes up or down in the next 60 seconds.
           </p>
         )}
       </div>
     ),
     intents,
   })
-})
+}
 
-app.frame('/waiting/:direction/:startTs/:startPrice', (c) => {
-  const direction = c.req.param('direction').toUpperCase()
-  const startTs = Number(c.req.param('startTs'))
-  const startPrice = c.req.param('startPrice')
+app.frame('/waiting', async (c) => { return waitingFrame(c) })
+app.frame('/waiting/:addr', async (c) => { return waitingFrame(c, c.req.param('addr')) })
+
+async function waitingFrame(c: any, explicitAddr?: string) {
+  const userAddress = await getUserAddress(c, explicitAddr)
+  const forwardAddr = userAddress || ''
+
+  if (!userAddress) {
+    return c.res({
+      image: (
+        <div style={{ alignItems: 'center', background: '#222', display: 'flex', flexDirection: 'column', height: '100%', justifyContent: 'center', width: '100%', color: 'white' }}>
+          <h1 style={{ fontSize: 56, color: '#ff6b6b' }}>Error: Wallet address lost!</h1>
+          <p style={{ fontSize: 28, marginTop: 10, padding: '0 40px', textAlign: 'center' }}>Devtools simulator couldn't map your profile. Please press Back to Play.</p>
+        </div>
+      ),
+      intents: [<Button action="/play">⬅️ Back to Play</Button>],
+    })
+  }
+
+  let roundId = 0
+  let startTime = 0
+  let startPrice = '--'
+  let direction = 'UP'
+  let isSettled = false
+
+  try {
+    const r = await publicClient.readContract({
+      address: CONTRACT_ADDRESS,
+      abi: GLOWSTICK_ABI,
+      functionName: 'activeRounds',
+      args: [userAddress],
+    })
+    roundId = Number(r[0])
+    startTime = Number(r[1])
+    if (r[2]) startPrice = formatUnits(r[2] as bigint, 8)
+    direction = Boolean(r[5]) ? 'UP' : 'DOWN'
+    isSettled = Boolean(r[6])
+  } catch (e) {}
+
+  if (c.transactionId && isSettled) {
+     return c.res({
+       headers: { Refresh: '2' },
+       image: (
+         <div style={{ alignItems: 'center', background: '#1a1a2e', display: 'flex', flexDirection: 'column', height: '100%', justifyContent: 'center', width: '100%', color: 'white' }}>
+           <h1 style={{ fontSize: 50, color: '#ffd98f' }}>Fetching New Bet...</h1>
+           <p style={{ fontSize: 24, marginTop: 14 }}>Transaction was mined. Waiting for blockchain nodes to sync state.</p>
+         </div>
+       ),
+       intents: [ <Button action={`/waiting/${forwardAddr}`}>🔄 Force Refresh</Button>, <Button action={`/play/${forwardAddr}`}>⬅️ Cancel</Button> ]
+     })
+  }
+
+  if (isSettled) {
+     return c.res({
+       image: (
+         <div style={{ alignItems: 'center', background: '#1a1a2e', display: 'flex', flexDirection: 'column', height: '100%', justifyContent: 'center', width: '100%', color: 'white' }}>
+           <h1 style={{ fontSize: 60, color: '#00ffcc' }}>Round #{roundId} Settled!</h1>
+           <p style={{ fontSize: 30, color: '#aaa' }}>Check the results for your payout.</p>
+         </div>
+       ),
+       intents: [ <Button action={`/result/${forwardAddr}`}>📊 View Result</Button> ]
+     })
+  }
+
+  if (startTime === 0) {
+     return c.res({
+       headers: { Refresh: '2' },
+       image: (
+         <div style={{ alignItems: 'center', background: '#1a1a2e', display: 'flex', flexDirection: 'column', height: '100%', justifyContent: 'center', width: '100%', color: 'white' }}>
+           <h1 style={{ fontSize: 50, color: '#ffd98f' }}>Fetching Blockchain State...</h1>
+           <p style={{ fontSize: 24, marginTop: 14 }}>Your transaction was submitted and is being indexed.</p>
+         </div>
+       ),
+       intents: [ <Button action={`/waiting/${forwardAddr}`}>🔄 Refresh</Button>, <Button action={`/play/${forwardAddr}`}>⬅️ Cancel</Button> ]
+     })
+  }
+
   const now = Math.floor(Date.now() / 1000)
-  const timeLeft = Number.isFinite(startTs) ? Math.max(0, 60 - (now - startTs)) : 0
-  const elapsed = Number.isFinite(startTs) ? Math.max(0, now - startTs) : 0
+  const timeLeft = Math.max(0, 60 - (now - startTime))
+  const elapsed = Math.max(0, now - startTime)
 
   return c.res({
-    headers: {
-      Refresh: timeLeft > 0 ? '1' : '3',
-    },
+    headers: { Refresh: timeLeft > 0 ? '1' : '3' },
     image: (
-      <div
-        style={{
-          alignItems: 'center',
-          background: 'radial-gradient(circle at 50% 50%, #1a1a2e 0%, #16213e 100%)',
-          display: 'flex',
-          flexDirection: 'column',
-          height: '100%',
-          justifyContent: 'center',
-          width: '100%',
-          fontFamily: 'sans-serif',
-          color: 'white',
-        }}
-      >
+      <div style={{ alignItems: 'center', background: 'radial-gradient(circle at 50% 50%, #1a1a2e 0%, #16213e 100%)', display: 'flex', flexDirection: 'column', height: '100%', justifyContent: 'center', width: '100%', fontFamily: 'sans-serif', color: 'white' }}>
         <h1 style={{ fontSize: 60, color: '#00ffcc', margin: 0 }}>Bet Placed!</h1>
         <p style={{ fontSize: 36, marginTop: 20 }}>Direction: {direction}</p>
         <p style={{ fontSize: 28, color: '#aaa', marginTop: 20 }}>Start Price: ${startPrice}</p>
         <p style={{ fontSize: 44, marginTop: 14, color: '#fff' }}>[ {timeLeft > 0 ? `${timeLeft}s` : 'READY'} ]</p>
         <p style={{ fontSize: 20, color: '#9ea7ff', marginTop: 6 }}>Elapsed: {elapsed}s</p>
-        <p style={{ fontSize: 24, color: '#aaa', marginTop: 16 }}>
-          {timeLeft > 0 ? 'Timer auto-refreshes every second.' : '60s complete. Waiting for automation (usually 10-60s) or settle manually.'}
-        </p>
+        <p style={{ fontSize: 24, color: '#aaa', marginTop: 16 }}>{timeLeft > 0 ? 'Timer auto-refreshes every second.' : '60s complete. Waiting for automation or settle manually.'}</p>
       </div>
     ),
     intents: timeLeft > 0
-      ? [
-          <Button action={`/waiting/${direction.toLowerCase()}/${startTs}/${startPrice}`}>⏱ Live Timer</Button>,
-          <Button action={`/result/dev/${direction.toLowerCase()}/${startTs}/${startPrice}`}>📊 View Result</Button>,
-        ]
+      ? [ <Button action={`/waiting/${forwardAddr}`}>🔄 Refresh Timer</Button>, <Button action={`/play/${forwardAddr}`}>⬅️ Menu</Button> ]
       : [
-          <Button action={`/waiting/${direction.toLowerCase()}/${startTs}/${startPrice}`}>⏳ Wait Automation</Button>,
-          <Button.Transaction target="/settle" action={`/result/dev/${direction.toLowerCase()}/${startTs}/${startPrice}`}>⚙️ Manual Settle</Button.Transaction>,
-          <Button action={`/result/dev/${direction.toLowerCase()}/${startTs}/${startPrice}`}>📊 View Result</Button>,
+          <Button action={`/waiting/${forwardAddr}`}>⏳ Wait Block</Button>,
+          <Button.Transaction target="/settle" action={`/result/${forwardAddr}`}>⚙️ Manual Settle</Button.Transaction>,
+          <Button action={`/result/${forwardAddr}`}>📊 View Result</Button>,
         ],
   })
-})
+}
 
-app.frame('/result/dev/:direction/:startTs/:startPrice', async (c) => {
-  const direction = c.req.param('direction')
-  const startTs = Number(c.req.param('startTs'))
-  const startPriceRaw = c.req.param('startPrice')
-  const startPriceNum = Number(startPriceRaw)
-  const now = Math.floor(Date.now() / 1000)
-  const timeLeft = Number.isFinite(startTs) ? Math.max(0, 60 - (now - startTs)) : 0
-  const userAddress = getUserAddress(c)
+app.frame('/result', async (c) => { return resultFrame(c) })
+app.frame('/result/:addr', async (c) => { return resultFrame(c, c.req.param('addr')) })
 
-  let settledOnChain: boolean | null = null
-  let settledRoundId = 0
-  let pendingEth = '0'
+async function resultFrame(c: any, explicitAddr?: string) {
+  const userAddress = await getUserAddress(c, explicitAddr)
+  const forwardAddr = userAddress || ''
 
-  let latest = '--'
-  let latestNum = Number.NaN
-  try {
-    const res = await fetch('https://api.binance.com/api/v3/ticker/price?symbol=ETHUSDT')
-    const data = await res.json()
-    latest = parseFloat(data.price).toFixed(2)
-    latestNum = Number(latest)
-  } catch (e) {
-    console.error('Error reading latest price from Binance:', e)
-    try {
-      const lp = await publicClient.readContract({
-        address: CONTRACT_ADDRESS as `0x${string}`,
-        abi: GLOWSTICK_ABI,
-        functionName: 'getLatestPrice',
-      })
-      latest = formatUnits(lp, 8)
-      latestNum = Number(latest)
-    } catch(err) {}
-  }
-
-  if (userAddress) {
-    try {
-      const r = await publicClient.readContract({
-        address: CONTRACT_ADDRESS as `0x${string}`,
-        abi: GLOWSTICK_ABI,
-        functionName: 'activeRounds',
-        args: [userAddress],
-      })
-      settledRoundId = Number(r[0])
-      settledOnChain = Boolean(r[6])
-
-      const pending = await publicClient.readContract({
-        address: CONTRACT_ADDRESS as `0x${string}`,
-        abi: GLOWSTICK_ABI,
-        functionName: 'pendingWithdrawals',
-        args: [userAddress],
-      })
-      pendingEth = formatUnits(pending, 18)
-    } catch (e) {
-      console.error('Error checking on-chain settlement for dev result:', e)
-    }
-  }
-
-  if (timeLeft > 0) {
-    return c.res({
-      headers: {
-        Refresh: '1',
-      },
-      image: (
-        <div style={{ alignItems: 'center', background: '#1a1a2e', display: 'flex', flexDirection: 'column', height: '100%', justifyContent: 'center', width: '100%', color: 'white' }}>
-          <h1 style={{ fontSize: 56 }}>[ {timeLeft}s LEFT ]</h1>
-          <p style={{ fontSize: 28, marginTop: 14 }}>Waiting for 60-second window to finish...</p>
-        </div>
-      ),
-      intents: [
-        <Button action={`/waiting/${direction}/${startTs}/${startPriceRaw}`}>⏱ Live Timer</Button>,
-        <Button action={`/result/dev/${direction}/${startTs}/${startPriceRaw}`}>📊 Refresh Result</Button>,
-      ],
-    })
-  }
-
-  const validPrices = Number.isFinite(startPriceNum) && Number.isFinite(latestNum)
-  const movedUp = validPrices ? latestNum > startPriceNum : false
-  const draw = validPrices ? latestNum === startPriceNum : false
-  const won = draw ? false : direction === 'up' ? movedUp : !movedUp
-
-  return c.res({
-    image: (
-      <div style={{ alignItems: 'center', background: draw ? '#203040' : won ? '#003300' : '#330000', display: 'flex', flexDirection: 'column', height: '100%', justifyContent: 'center', width: '100%', color: 'white' }}>
-        <h1 style={{ fontSize: 80, margin: 0 }}>{draw ? 'DRAW' : won ? 'YOU WON!' : 'YOU LOST.'}</h1>
-        <p style={{ fontSize: 32, marginTop: 16 }}>Start: ${startPriceRaw} | Now: ${latest}</p>
-        {settledOnChain === true ? (
-          <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', marginTop: 16 }}>
-            <p style={{ fontSize: 22, margin: 0, color: '#a8ffcb' }}>
-              On-chain settlement confirmed for your wallet (round #{settledRoundId}).
-            </p>
-            <p style={{ fontSize: 20, marginTop: 8, color: '#ffd98f' }}>
-              Queued payout: {pendingEth} ETH
-            </p>
-          </div>
-        ) : settledOnChain === false ? (
-          <p style={{ fontSize: 22, marginTop: 16, color: '#ffd98f' }}>
-            Not settled on-chain yet. Wait for automation or use Manual Settle.
-          </p>
-        ) : (
-          <p style={{ fontSize: 22, marginTop: 16, color: '#d6ffd6' }}>
-            DevTools preview only (no wallet context). On-chain settlement cannot be verified here.
-          </p>
-        )}
-      </div>
-    ),
-    intents: settledOnChain === true
-      ? pendingEth !== '0'
-        ? [
-            <Button.Transaction target="/claim" action={`/result/dev/${direction}/${startTs}/${startPriceRaw}`}>💰 Withdraw Queued Payout</Button.Transaction>,
-            <Button action="/result">✅ Open On-Chain Result</Button>,
-            <Button action="/play">🔄 New Bet</Button>,
-          ]
-        : [
-            <Button action="/result">✅ Open On-Chain Result</Button>,
-            <Button action="/play">🔄 New Bet</Button>,
-          ]
-      : [
-          <Button.Transaction target="/settle" action={`/result/dev/${direction}/${startTs}/${startPriceRaw}`}>⚙️ Settle On-Chain</Button.Transaction>,
-          <Button action="/result">🔎 Open On-Chain Result</Button>,
-          <Button action="/play">🔄 New Bet</Button>,
-        ],
-  })
-})
-
-app.frame('/result', async (c) => {
-  const userAddress = getUserAddress(c)
   if (!userAddress) {
     return c.res({
-      image: (
-        <div style={{ alignItems: 'center', background: '#111', display: 'flex', flexDirection: 'column', height: '100%', justifyContent: 'center', width: '100%', color: 'white' }}>
-          <h1 style={{ fontSize: 56 }}>Connect a wallet in frame context</h1>
-          <p style={{ fontSize: 28, color: '#aaa' }}>Then return to Play.</p>
-        </div>
-      ),
-      intents: [<Button action="/play">⬅️ Back to Play</Button>],
+      image: <div style={{ alignItems: 'center', background: '#111', display: 'flex', flexDirection: 'column', height: '100%', justifyContent: 'center', width: '100%', color: 'white' }}><h1 style={{ fontSize: 56 }}>Address missing</h1></div>,
+      intents: [<Button action="/play">⬅️ Back</Button>],
     })
   }
 
@@ -500,19 +377,19 @@ app.frame('/result', async (c) => {
   let won = false
   let timeLeft = 0
   let pending = BigInt(0)
-  let vault = BigInt(0)
+
+  let latestPriceStr = '--'
+  try {
+    const res = await fetch('https://api.binance.com/api/v3/ticker/price?symbol=ETHUSDT')
+    const data = await res.json()
+    latestPriceStr = parseFloat(data.price).toFixed(2)
+  } catch (e) {}
 
   try {
-    const r = await publicClient.readContract({
-      address: CONTRACT_ADDRESS as `0x${string}`,
-      abi: GLOWSTICK_ABI,
-      functionName: 'activeRounds',
-      args: [userAddress],
-    })
-
+    const r = await publicClient.readContract({ address: CONTRACT_ADDRESS, abi: GLOWSTICK_ABI, functionName: 'activeRounds', args: [userAddress] })
     roundId = Number(r[0])
-    startPrice = r[2]
-    endPrice = r[3]
+    startPrice = r[2] as bigint
+    endPrice = r[3] as bigint
     settled = Boolean(r[6])
     won = Boolean(r[7])
 
@@ -522,118 +399,112 @@ app.frame('/result', async (c) => {
       timeLeft = Math.max(0, 60 - (now - startTime))
     }
 
-    pending = await publicClient.readContract({
-      address: CONTRACT_ADDRESS as `0x${string}`,
-      abi: GLOWSTICK_ABI,
-      functionName: 'pendingWithdrawals',
-      args: [userAddress],
-    })
-
-    vault = await publicClient.readContract({
-      address: CONTRACT_ADDRESS as `0x${string}`,
-      abi: GLOWSTICK_ABI,
-      functionName: 'getVaultBalance',
-    })
-  } catch (e) {
-    console.error('Error loading result:', e)
-  }
+    const pendingBal = await publicClient.readContract({ address: CONTRACT_ADDRESS, abi: GLOWSTICK_ABI, functionName: 'pendingWithdrawals', args: [userAddress] })
+    pending = pendingBal as bigint
+  } catch (e) {}
 
   if (roundId === 0) {
     return c.res({
-      image: (
-        <div style={{ alignItems: 'center', background: '#111', display: 'flex', flexDirection: 'column', height: '100%', justifyContent: 'center', width: '100%', color: 'white' }}>
-          <h1 style={{ fontSize: 56 }}>No round found</h1>
-          <p style={{ fontSize: 28, color: '#aaa' }}>Place a new bet first.</p>
-        </div>
-      ),
-      intents: [<Button action="/play">🎮 Start Bet</Button>],
+      image: <div style={{ alignItems: 'center', background: '#111', display: 'flex', flexDirection: 'column', height: '100%', justifyContent: 'center', width: '100%', color: 'white' }}><h1 style={{ fontSize: 56 }}>No round found</h1></div>,
+      intents: [<Button action={`/play/${forwardAddr}`}>🎮 Start Bet</Button>],
     })
   }
 
   if (!settled) {
+    if (timeLeft > 0) {
+       return c.res({
+         headers: { Refresh: '1' },
+         image: <div style={{ alignItems: 'center', background: '#1a1a2e', display: 'flex', flexDirection: 'column', height: '100%', justifyContent: 'center', width: '100%', color: 'white' }}><h1 style={{ fontSize: 56 }}>[ {timeLeft}s LEFT ]</h1></div>,
+         intents: [<Button action={`/waiting/${forwardAddr}`}>🔄 Refresh Timer</Button>],
+       })
+    }
+
+    if (c.transactionId) {
+       return c.res({
+         headers: { Refresh: '2' },
+         image: (
+           <div style={{ alignItems: 'center', background: '#1a1a2e', display: 'flex', flexDirection: 'column', height: '100%', justifyContent: 'center', width: '100%', color: 'white' }}>
+             <h1 style={{ fontSize: 50, color: '#ffd98f' }}>Verifying Settlement...</h1>
+             <p style={{ fontSize: 24, marginTop: 14 }}>Transaction was mined. Waiting for blockchain nodes to sync state.</p>
+           </div>
+         ),
+         intents: [<Button action={`/result/${forwardAddr}`}>🔄 Force Refresh</Button>],
+       })
+    }
+
     return c.res({
       image: (
         <div style={{ alignItems: 'center', background: '#1a1a2e', display: 'flex', flexDirection: 'column', height: '100%', justifyContent: 'center', width: '100%', color: 'white' }}>
-          <h1 style={{ fontSize: 56 }}>{timeLeft > 0 ? `[ ${timeLeft}s LEFT ]` : '[ READY ]'}</h1>
-          <p style={{ fontSize: 28, marginTop: 14 }}>Round #{roundId} is not settled yet.</p>
+          <h1 style={{ fontSize: 56 }}>[ READY TO SETTLE ]</h1>
+          <p style={{ fontSize: 28, marginTop: 14 }}>Round #{roundId} is finished but not yet settled on-chain.</p>
+          <p style={{ fontSize: 28, marginTop: 14, color: '#00ffcc' }}>Live Price: ${latestPriceStr}</p>
         </div>
       ),
-      intents: timeLeft > 0
-        ? [<Button action="/result">🔄 Refresh</Button>, <Button action="/play">⬅️ Back</Button>]
-        : [<Button.Transaction target="/settle" action="/result">⚙️ Settle Now</Button.Transaction>, <Button action="/result">🔄 Refresh</Button>],
+      intents: [<Button.Transaction target="/settle" action={`/result/${forwardAddr}`}>⚙️ Settle Now</Button.Transaction>, <Button action={`/result/${forwardAddr}`}>🔄 Check Status</Button>],
     })
   }
 
+  const startPriceNum = Number(formatUnits(startPrice, 8))
+  const endPriceNum = Number(formatUnits(endPrice, 8))
   const draw = endPrice === startPrice
 
   return c.res({
     image: (
       <div style={{ alignItems: 'center', background: draw ? '#203040' : won ? '#003300' : '#330000', display: 'flex', flexDirection: 'column', height: '100%', justifyContent: 'center', width: '100%', color: 'white' }}>
         <h1 style={{ fontSize: 80, margin: 0 }}>{draw ? 'DRAW' : won ? 'YOU WON!' : 'YOU LOST.'}</h1>
-        <p style={{ fontSize: 34, marginTop: 16 }}>
-          Start: ${formatUnits(startPrice, 8)} | End: ${formatUnits(endPrice, 8)}
-        </p>
-        <p style={{ fontSize: 24, marginTop: 16, color: '#d6ffd6' }}>
-          {won ? 'Payout is auto-sent.' : draw ? 'Stake refunded automatically.' : 'Round settled on-chain.'}
-        </p>
-        <p style={{ fontSize: 20, marginTop: 10, color: '#a8c6ff' }}>
-          Vault Balance: {formatUnits(vault, 18)} ETH | Pending: {formatUnits(pending, 18)} ETH
-        </p>
+        <p style={{ fontSize: 34, marginTop: 16 }}>Start: ${startPriceNum.toFixed(2)} | End: ${endPriceNum.toFixed(2)}</p>
+        <p style={{ fontSize: 24, marginTop: 16, color: '#d6ffd6' }}>{won ? 'Payout was processed on-chain.' : draw ? 'Stake refunded.' : 'Better luck next time.'}</p>
+        <p style={{ fontSize: 20, marginTop: 10, color: '#a8c6ff' }}>Pending manual claim: {formatUnits(pending, 18)} ETH</p>
       </div>
     ),
     intents: pending > BigInt(0)
-      ? [<Button.Transaction target="/claim" action="/result">💰 Withdraw Queued Payout</Button.Transaction>, <Button action="/play">🔄 New Bet</Button>]
-      : [<Button action="/play">🔄 New Bet</Button>],
+      ? [<Button.Transaction target="/claim" action={`/result/${forwardAddr}`}>💰 Withdraw Payout</Button.Transaction>, <Button action={`/play/${forwardAddr}`}>🔄 New Bet</Button>]
+      : [<Button action={`/play/${forwardAddr}`}>🔄 New Bet</Button>],
   })
-})
+}
 
 app.transaction('/faucet', (c) => {
-  return c.contract({
-    abi: GLOWSTICK_ABI,
-    chainId: 'eip155:11155111',
-    functionName: 'faucet',
-    to: CONTRACT_ADDRESS,
-  })
+  return c.contract({ abi: GLOWSTICK_ABI, chainId: 'eip155:11155111', functionName: 'faucet', to: CONTRACT_ADDRESS })
 })
 
-app.transaction('/bet/:direction', (c) => {
+app.transaction('/bet/:direction', async (c) => {
   const isUp = c.req.param('direction') === 'up'
+  let betValue = parseEther(c.inputText || '0.01')
+  
+  const userAddress = await getUserAddress(c) || '0x0000000000000000000000000000000000000000'
+  const res = await fetch('https://api.binance.com/api/v3/ticker/price?symbol=ETHUSDT')
+  const data = await res.json()
+  const binancePriceBigInt = BigInt(Math.floor(parseFloat(data.price) * 1e8))
+  const deadline = BigInt(Math.floor(Date.now() / 1000) + 3600)
 
-  const inputText = c.inputText || '0.01'
-  let betValue = BigInt(0)
-  try {
-    betValue = parseEther(inputText)
-  } catch (e) {
-    betValue = parseEther('0.01')
-  }
+  const structHash = keccak256(encodePacked(['address', 'string', 'bool', 'int256', 'uint256'], [userAddress, 'BET', isUp, binancePriceBigInt, deadline]))
+  const signature = await account.signMessage({ message: { raw: structHash } })
 
-  return c.contract({
-    abi: GLOWSTICK_ABI,
-    chainId: 'eip155:11155111',
-    functionName: 'bet',
-    args: [isUp],
-    to: CONTRACT_ADDRESS,
-    value: betValue,
-  })
+  return c.contract({ abi: GLOWSTICK_ABI, chainId: 'eip155:11155111', functionName: 'bet', args: [isUp, binancePriceBigInt, deadline, signature], to: CONTRACT_ADDRESS, value: betValue })
 })
 
-app.transaction('/settle', (c) => {
-  return c.contract({
-    abi: GLOWSTICK_ABI,
-    chainId: 'eip155:11155111',
-    functionName: 'settleMyRound',
-    to: CONTRACT_ADDRESS,
-  })
+app.transaction('/settle', async (c) => {
+  const userAddress = await getUserAddress(c) || '0x0000000000000000000000000000000000000000'
+  
+  let roundId = BigInt(0)
+  try {
+    const r = await publicClient.readContract({ address: CONTRACT_ADDRESS, abi: GLOWSTICK_ABI, functionName: 'activeRounds', args: [userAddress] })
+    roundId = r[0] as bigint
+  } catch(e) {}
+
+  const res = await fetch('https://api.binance.com/api/v3/ticker/price?symbol=ETHUSDT')
+  const data = await res.json()
+  const binancePriceBigInt = BigInt(Math.floor(parseFloat(data.price) * 1e8))
+  const deadline = BigInt(Math.floor(Date.now() / 1000) + 3600)
+
+  const structHash = keccak256(encodePacked(['address', 'uint256', 'string', 'int256', 'uint256'], [userAddress, roundId, 'SETTLE', binancePriceBigInt, deadline]))
+  const signature = await account.signMessage({ message: { raw: structHash } })
+
+  return c.contract({ abi: GLOWSTICK_ABI, chainId: 'eip155:11155111', functionName: 'settleMyRound', args: [binancePriceBigInt, deadline, signature], to: CONTRACT_ADDRESS })
 })
 
 app.transaction('/claim', (c) => {
-  return c.contract({
-    abi: GLOWSTICK_ABI,
-    chainId: 'eip155:11155111',
-    functionName: 'claim',
-    args: [BigInt(0)],
-    to: CONTRACT_ADDRESS,
-  })
+  return c.contract({ abi: GLOWSTICK_ABI, chainId: 'eip155:11155111', functionName: 'claim', args: [BigInt(0)], to: CONTRACT_ADDRESS })
 })
 
 devtools(app, { serveStatic })

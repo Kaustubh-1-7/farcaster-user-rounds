@@ -2,15 +2,8 @@
 pragma solidity ^0.8.19;
 
 import {Ownable} from "openzeppelin-contracts/contracts/access/Ownable.sol";
-
-// Minimal Chainlink Interfaces to avoid massive dependency cloning
-interface AggregatorV3Interface {
-    function decimals() external view returns (uint8);
-    function description() external view returns (string memory);
-    function version() external view returns (uint256);
-    function getRoundData(uint80 _roundId) external view returns (uint80 roundId, int256 answer, uint256 startedAt, uint256 updatedAt, uint80 answeredInRound);
-    function latestRoundData() external view returns (uint80 roundId, int256 answer, uint256 startedAt, uint256 updatedAt, uint80 answeredInRound);
-}
+import {ECDSA} from "openzeppelin-contracts/contracts/utils/cryptography/ECDSA.sol";
+import {MessageHashUtils} from "openzeppelin-contracts/contracts/utils/cryptography/MessageHashUtils.sol";
 
 interface AutomationCompatibleInterface {
     function checkUpkeep(bytes calldata checkData) external view returns (bool upkeepNeeded, bytes memory performData);
@@ -23,7 +16,7 @@ contract GlowStick is Ownable, AutomationCompatibleInterface {
     uint256 public constant ROUND_DURATION = 60 seconds; 
     uint256 public constant FEE_PERCENTAGE = 15; // 1.5% fee (divide by 1000)
 
-    AggregatorV3Interface public immutable PRICE_FEED;
+    address public authorizer;
 
     // --- State Variables ---
     uint256 public treasuryFees; // Accumulated fees for the owner
@@ -59,14 +52,18 @@ contract GlowStick is Ownable, AutomationCompatibleInterface {
     event UserRoundActivated(address indexed user, uint256 indexed roundId);
     event UserRoundDeactivated(address indexed user, uint256 indexed roundId);
     
-    // pass the price feed address (Sepolia ETH/USD: 0x694AA1769357215DE4FAC081bf1f309aDC325306)
-    constructor(address _priceFeedAddress) Ownable(msg.sender) {
-        PRICE_FEED = AggregatorV3Interface(_priceFeedAddress);
+    constructor(address _authorizer) Ownable(msg.sender) {
+        authorizer = _authorizer;
     }
 
-    function getLatestPrice() external view returns (int256) {
-        (, int256 price, , , ) = PRICE_FEED.latestRoundData();
-        return price;
+    function setAuthorizer(address _authorizer) external onlyOwner {
+        authorizer = _authorizer;
+    }
+
+    function _verifySignature(bytes32 dataHash, bytes calldata signature) internal view {
+        bytes32 ethSignedMessageHash = MessageHashUtils.toEthSignedMessageHash(dataHash);
+        address recoveredSigner = ECDSA.recover(ethSignedMessageHash, signature);
+        require(recoveredSigner == authorizer, "Invalid signature");
     }
 
     function getVaultBalance() external view returns (uint256) {
@@ -84,23 +81,26 @@ contract GlowStick is Ownable, AutomationCompatibleInterface {
 
     // --- Betting Function ---
     // User starts a private 60-second prediction round.
-    function bet(bool _isUp) external payable {
+    function bet(bool _isUp, int256 _binancePrice, uint256 _deadline, bytes calldata _signature) external payable {
         require(msg.value > 0, "Bet amount must be > 0");
+        require(block.timestamp <= _deadline, "Signature expired");
+
+        bytes32 structHash = keccak256(abi.encodePacked(msg.sender, "BET", _isUp, _binancePrice, _deadline));
+        _verifySignature(structHash, _signature);
 
         if (hasActiveRound(msg.sender)) {
             UserRound memory existing = activeRounds[msg.sender];
             require(block.timestamp >= existing.startTime + ROUND_DURATION, "Active round exists");
-            _settleRound(msg.sender);
+            _settleRound(msg.sender, _binancePrice);
         }
 
-        (, int256 price, , , ) = PRICE_FEED.latestRoundData();
         uint256 newRoundId = userRoundNonce[msg.sender] + 1;
         userRoundNonce[msg.sender] = newRoundId;
 
         activeRounds[msg.sender] = UserRound({
             roundId: newRoundId,
             startTime: block.timestamp,
-            startPrice: price,
+            startPrice: _binancePrice,
             endPrice: 0,
             amount: msg.value,
             isUp: _isUp,
@@ -110,40 +110,38 @@ contract GlowStick is Ownable, AutomationCompatibleInterface {
 
         _activateUser(msg.sender);
 
-        emit BetPlaced(msg.sender, newRoundId, _isUp, msg.value, price);
+        emit BetPlaced(msg.sender, newRoundId, _isUp, msg.value, _binancePrice);
         emit UserRoundActivated(msg.sender, newRoundId);
     }
 
     // User settles their own round after 60 seconds.
-    function settleMyRound() external {
-        _settleRound(msg.sender);
+    function settleMyRound(int256 _binancePrice, uint256 _deadline, bytes calldata _signature) external {
+        require(block.timestamp <= _deadline, "Signature expired");
+        
+        UserRound memory r = activeRounds[msg.sender];
+        require(r.roundId != 0, "No round found");
+
+        bytes32 structHash = keccak256(abi.encodePacked(msg.sender, r.roundId, "SETTLE", _binancePrice, _deadline));
+        _verifySignature(structHash, _signature);
+
+        _settleRound(msg.sender, _binancePrice);
     }
 
-    // Chainlink Automation check: finds one matured active user round.
+    // Chainlink Automation check is disabled since we rely on signed prices in this version
     function checkUpkeep(bytes calldata) external view override returns (bool upkeepNeeded, bytes memory performData) {
-        for (uint256 i = 0; i < activeUsers.length; i++) {
-            address user = activeUsers[i];
-            UserRound memory r = activeRounds[user];
-            if (!r.settled && r.roundId != 0 && block.timestamp >= r.startTime + ROUND_DURATION) {
-                return (true, abi.encode(user));
-            }
-        }
         return (false, bytes(""));
     }
 
-    // Chainlink Automation perform: settles the provided matured user round.
     function performUpkeep(bytes calldata performData) external override {
-        address user = abi.decode(performData, (address));
-        _settleRound(user);
+        revert("Automation Disabled");
     }
 
-    function _settleRound(address _user) internal {
+    function _settleRound(address _user, int256 finalPrice) internal {
         UserRound storage r = activeRounds[_user];
         require(r.roundId != 0, "No round found");
         require(!r.settled, "Round already settled");
         require(block.timestamp >= r.startTime + ROUND_DURATION, "Round not finished");
 
-        (, int256 finalPrice, , , ) = PRICE_FEED.latestRoundData();
         r.endPrice = finalPrice;
         r.settled = true;
 
